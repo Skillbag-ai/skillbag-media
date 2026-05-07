@@ -72,6 +72,20 @@ STOPWORDS = {
     "may",
     "should",
     "must",
+    "yeah",
+    "yes",
+    "okay",
+    "ok",
+    "like",
+    "know",
+    "right",
+    "just",
+    "actually",
+    "gonna",
+    "well",
+    "really",
+    "probably",
+    "maybe",
 }
 
 
@@ -177,6 +191,22 @@ def enforce_word_range(summary: str, min_words: int, max_words: int, keywords: L
     return trim_to_words(summary, max_words)
 
 
+def bad_hf_summary(summary: str, min_words: int) -> bool:
+    lowered = summary.lower()
+    prompt_leakage = (
+        "write one human-readable paragraph" in lowered
+        or "write a professional paragraph" in lowered
+        or "this is a meeting transcript" in lowered
+        or "summarize this meeting" in lowered
+        or "covering the main topic" in lowered
+        or "do not invent details" in lowered
+        or lowered.startswith("summarize:")
+    )
+    repeated_fallback = lowered.count("important recurring themes include") > 1
+    too_short = word_count(summary) < max(25, min_words // 3)
+    return prompt_leakage or repeated_fallback or too_short
+
+
 def select_context(text: str, max_words: int = 700) -> str:
     sentences = split_sentences(text)
     if not sentences:
@@ -204,38 +234,30 @@ def select_context(text: str, max_words: int = 700) -> str:
 
 class HFSummaryBackend:
     def __init__(self, model_id: str):
-        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        from transformers import pipeline
 
         self.model_id = model_id
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
-
-    def generate(self, prompt: str, max_new_tokens: int, min_new_tokens: int) -> str:
-        import torch
-
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-        with torch.no_grad():
-            out_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                min_new_tokens=min_new_tokens,
-                num_beams=4,
-                no_repeat_ngram_size=3,
-                early_stopping=True,
-            )
-        return normalize_text(self.tokenizer.decode(out_ids[0], skip_special_tokens=True))
+        self.pipeline = pipeline("summarization", model=model_id, tokenizer=model_id)
 
     def summarize(self, title: str, text: str, keywords: List[str], min_words: int, max_words: int) -> str:
-        context = select_context(text, max_words=700)
-        prompt = (
-            "summarize: Write one human-readable paragraph between 100 and 190 words. "
-            "Summarize this meeting or call transcript for later reuse. Include the main topic, "
-            "important decisions, action themes, unresolved questions, and why the conversation matters. "
-            "Do not invent details. "
-            f"Title: {title}. Content: {context}"
+        context = select_context(text, max_words=900)
+        word_total = max(40, word_count(context))
+        max_length = min(180, max(32, int(word_total * 0.5)))
+        min_length = min(70, max(12, max_length // 3))
+        result = self.pipeline(
+            context,
+            max_length=max_length,
+            min_length=min_length,
+            do_sample=False,
+            truncation=True,
         )
-        summary = self.generate(prompt, max_new_tokens=220, min_new_tokens=110)
-        return enforce_word_range(summary or context, min_words=min_words, max_words=max_words, keywords=keywords)
+        summary = normalize_text(result[0]["summary_text"] if result else "")
+        if bad_hf_summary(summary, min_words=min_words):
+            raise RuntimeError("Hugging Face summary failed quality checks")
+        final_summary = enforce_word_range(summary or context, min_words=min_words, max_words=max_words, keywords=keywords)
+        if bad_hf_summary(final_summary, min_words=min_words):
+            raise RuntimeError("Hugging Face summary failed quality checks")
+        return final_summary
 
 
 def heuristic_summary(title: str, text: str, keywords: List[str], min_words: int, max_words: int) -> str:
@@ -268,15 +290,34 @@ def summarize(title: str, text: str, backend: str, model_id: str, min_words: int
     )
 
 
-def select_lines(text: str, patterns: List[str], limit: int = 8) -> List[str]:
-    output: List[str] = []
+def evidence_units(text: str) -> List[str]:
+    units: List[str] = []
     for raw in text.splitlines():
         line = raw.strip(" -\t")
-        if len(line) < 12:
+        if not line or line.startswith("#") or line == "---":
             continue
-        lowered = line.lower()
+        if len(line) > 420:
+            units.extend(split_sentences(line))
+        else:
+            units.append(line)
+    if len(units) <= 1:
+        units = split_sentences(text)
+    return [unit.strip() for unit in units if len(unit.strip()) >= 12]
+
+
+def compact_evidence(text: str, max_chars: int = 280) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def select_lines(text: str, patterns: List[str], limit: int = 8) -> List[str]:
+    output: List[str] = []
+    for unit in evidence_units(text):
+        lowered = unit.lower()
         if any(pattern in lowered for pattern in patterns):
-            output.append(line)
+            output.append(compact_evidence(unit))
         if len(output) >= limit:
             break
     return output
@@ -284,12 +325,9 @@ def select_lines(text: str, patterns: List[str], limit: int = 8) -> List[str]:
 
 def timestamp_evidence(text: str, limit: int = 8) -> List[str]:
     output: List[str] = []
-    for raw in text.splitlines():
-        if TIMESTAMP_RE.search(raw):
-            line = raw.strip()
-            if len(line) > 240:
-                line = line[:237].rstrip() + "..."
-            output.append(line)
+    for unit in evidence_units(text):
+        if TIMESTAMP_RE.search(unit):
+            output.append(compact_evidence(unit, max_chars=240))
         if len(output) >= limit:
             break
     return output
