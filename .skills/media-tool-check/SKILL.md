@@ -39,7 +39,9 @@ optional:
   or downloadable Hugging Face ASR model.
 - Call summaries use Python `transformers` and `torch` with a local or
   downloadable Hugging Face summarization model by default.
-- Screen OCR can use `tesseract`; Pillow improves image preprocessing.
+- Screen OCR can use `tesseract` with Pillow image preprocessing, or local
+  Hugging Face image-to-text when `transformers`, `torch`, and Pillow are
+  available.
 - Do not install packages or system tools automatically unless the consuming
   workspace explicitly allows that behavior.
 

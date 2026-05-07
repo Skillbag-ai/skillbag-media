@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -20,10 +21,23 @@ try:
 except Exception:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
+try:
+    from PIL import Image, ImageFilter, ImageOps
+except Exception:  # pragma: no cover
+    Image = None  # type: ignore[assignment]
+    ImageFilter = None  # type: ignore[assignment]
+    ImageOps = None  # type: ignore[assignment]
+
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 OCR_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*")
 _ASR_PIPE = None
+_HF_OCR_PIPE = None
+
+warnings.filterwarnings(
+    "ignore",
+    message="Using `chunk_length_s` is very experimental with seq2seq models.*",
+)
 
 
 @dataclass
@@ -52,7 +66,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-asr-model", default="openai/whisper-large-v3-turbo")
     parser.add_argument("--asr-segment-seconds", type=int, default=60)
     parser.add_argument("--asr-device", choices=("cpu", "mps", "auto"), default="cpu")
-    parser.add_argument("--ocr-backend", choices=("auto", "tesseract", "none"), default="auto")
+    parser.add_argument("--hf-ocr-model", default="microsoft/trocr-base-printed")
+    parser.add_argument("--ocr-backend", choices=("auto", "tesseract", "hf", "none"), default="auto")
+    parser.add_argument("--ocr-mode", choices=("transcript-first", "hybrid", "interval"), default="transcript-first")
     parser.add_argument("--ocr-interval", type=int, default=20)
     parser.add_argument("--min-ocr-score", type=float, default=80.0)
     parser.add_argument("--ocr-similarity-threshold", type=float, default=0.92)
@@ -145,7 +161,7 @@ def get_asr_pipe(model_id: str, asr_device: str):
     kwargs = {"model": model_id, "device": device}
     if dtype is not None:
         kwargs["dtype"] = dtype
-    _ASR_PIPE = pipeline("automatic-speech-recognition", **kwargs)
+    _ASR_PIPE = pipeline("automatic-speech-recognition", ignore_warning=True, **kwargs)
     return _ASR_PIPE
 
 
@@ -197,7 +213,15 @@ def transcribe_with_chunks(path: Path, args: argparse.Namespace) -> Tuple[str, L
                     check=False,
                 )
                 if proc.returncode == 0 and clip_path.exists():
-                    out = pipe(str(clip_path), chunk_length_s=30)
+                    kwargs = {"chunk_length_s": 30}
+                    if not args.hf_asr_model.endswith(".en"):
+                        kwargs["generate_kwargs"] = {"language": "english", "task": "transcribe"}
+                    try:
+                        out = pipe(str(clip_path), **kwargs)
+                    except OverflowError:
+                        retry_kwargs = dict(kwargs)
+                        retry_kwargs.pop("chunk_length_s", None)
+                        out = pipe(str(clip_path), **retry_kwargs)
                     text = str(out.get("text", "") if isinstance(out, dict) else out).strip()
                     if text:
                         chunks.append(TranscriptChunk(start_s=start_s, end_s=end_s, text=text))
@@ -211,11 +235,14 @@ def transcribe_with_chunks(path: Path, args: argparse.Namespace) -> Tuple[str, L
 
 
 def score_ocr_text(text: str) -> float:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
     tokens = OCR_TOKEN_RE.findall(text)
     if not tokens:
         return 0.0
     unique_tokens = len({token.lower() for token in tokens})
-    return len(tokens) + (0.35 * unique_tokens)
+    avg_line_len = sum(len(line) for line in lines) / len(lines) if lines else 0.0
+    punctuation = sum(1 for ch in text if not ch.isalnum() and not ch.isspace())
+    return len(tokens) + (0.35 * unique_tokens) + (0.08 * min(avg_line_len, 120.0)) - (0.02 * punctuation)
 
 
 def run_tesseract(path: Path, psm: int) -> Tuple[str, str]:
@@ -228,6 +255,110 @@ def run_tesseract(path: Path, psm: int) -> Tuple[str, str]:
     if proc.returncode != 0:
         return "", f"tesseract-error:{(proc.stderr or '').strip()}"
     return (proc.stdout or "").strip(), f"tesseract-psm{psm}"
+
+
+def build_ocr_variants(path: Path) -> List[Tuple[Path, str, bool]]:
+    variants: List[Tuple[Path, str, bool]] = [(path, "original", False)]
+    if Image is None or ImageOps is None or ImageFilter is None:
+        return variants
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="media_timeline_frame_ocr_"))
+    try:
+        with Image.open(path) as img:
+            gray = ImageOps.grayscale(img)
+
+            enhanced = ImageOps.autocontrast(gray)
+            enhanced = enhanced.resize((enhanced.width * 2, enhanced.height * 2))
+            enhanced = enhanced.filter(ImageFilter.SHARPEN)
+            enhanced_path = temp_dir / f"{path.stem}-enhanced.png"
+            enhanced.save(enhanced_path)
+            variants.append((enhanced_path, "enhanced", True))
+
+            binary = ImageOps.autocontrast(gray)
+            binary = binary.resize((binary.width * 2, binary.height * 2))
+            binary = binary.point(lambda px: 255 if px > 180 else 0)
+            binary_path = temp_dir / f"{path.stem}-binary.png"
+            binary.save(binary_path)
+            variants.append((binary_path, "binary", True))
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return [(path, "original", False)]
+
+    return variants
+
+
+def extract_image_tesseract(path: Path) -> Tuple[str, str]:
+    variants = build_ocr_variants(path)
+    best_text = ""
+    best_method = ""
+    best_score = -1.0
+    try:
+        for variant_path, label, _is_temp in variants:
+            for psm in (11, 6):
+                text, method = run_tesseract(variant_path, psm)
+                if not text.strip():
+                    continue
+                score = score_ocr_text(text)
+                if score > best_score:
+                    best_score = score
+                    best_text = text
+                    best_method = f"{method}:{label}"
+    finally:
+        for variant_path, _label, is_temp in variants:
+            if is_temp:
+                try:
+                    variant_path.unlink()
+                except OSError:
+                    pass
+        for temp_dir in {variant.parent for variant, _label, is_temp in variants if is_temp}:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return best_text.strip(), best_method or "tesseract-unavailable"
+
+
+def extract_image_hf(path: Path, model_id: str) -> Tuple[str, str]:
+    global _HF_OCR_PIPE
+    if _HF_OCR_PIPE is None:
+        from transformers import pipeline
+
+        _HF_OCR_PIPE = pipeline("image-to-text", model=model_id)
+    out = _HF_OCR_PIPE(str(path))
+    if isinstance(out, list):
+        text = "\n".join(str(item.get("generated_text", "")).strip() for item in out)
+    elif isinstance(out, dict):
+        text = str(out.get("generated_text", "")).strip()
+    else:
+        text = str(out).strip()
+    return text, f"hf-image2text:{model_id}"
+
+
+def extract_image_text(path: Path, backend: str, hf_model: str) -> Tuple[str, str, float]:
+    if backend == "none":
+        return "", "disabled", 0.0
+    if backend == "tesseract":
+        text, method = extract_image_tesseract(path)
+        return text, method, score_ocr_text(text)
+    if backend == "hf":
+        text, method = extract_image_hf(path, hf_model)
+        return text, method, score_ocr_text(text)
+
+    best_text = ""
+    best_method = ""
+    best_score = 0.0
+
+    if has_command("tesseract"):
+        text, method = extract_image_tesseract(path)
+        score = score_ocr_text(text)
+        if score > best_score:
+            best_text, best_method, best_score = text, method, score
+
+    if has_module("transformers") and best_score < 140.0:
+        text, method = extract_image_hf(path, hf_model)
+        score = score_ocr_text(text)
+        if score > best_score:
+            best_text, best_method, best_score = text, method, score
+
+    return best_text.strip(), best_method or "unavailable", best_score
 
 
 def extract_frame(path: Path, ffmpeg_bin: str, at_s: float, temp_dir: Path) -> Optional[Path]:
@@ -243,20 +374,42 @@ def extract_frame(path: Path, ffmpeg_bin: str, at_s: float, temp_dir: Path) -> O
     return frame_path
 
 
-def candidate_ocr_times(chunks: List[TranscriptChunk], duration_s: float, interval: int) -> List[float]:
-    screen_words = ("show", "screen", "share", "here", "look", "see", "this", "demo", "settings", "policy")
+def candidate_ocr_times(chunks: List[TranscriptChunk], duration_s: float, mode: str, interval: int) -> List[float]:
+    screen_words = (
+        "show",
+        "screen",
+        "share",
+        "policy",
+        "tap",
+        "transfer",
+        "terraform",
+        "aws",
+        "callback",
+        "cosigner",
+        "whitelist",
+        "group",
+        "settings",
+        "fireblocks",
+        "here",
+        "this bit",
+        "look",
+        "see",
+    )
     times: List[float] = []
-    for chunk in chunks:
-        text = normalize_text(chunk.text)
-        if any(word in text for word in screen_words):
-            times.append(chunk.start_s)
-            times.append((chunk.start_s + chunk.end_s) / 2.0)
+    if mode in {"transcript-first", "hybrid"}:
+        for chunk in chunks:
+            text = normalize_text(chunk.text)
+            if any(word in text for word in screen_words):
+                times.append(max(0.0, chunk.start_s))
+                if chunk.end_s > chunk.start_s:
+                    times.append((chunk.start_s + chunk.end_s) / 2.0)
 
-    point = 0.0
-    while point <= duration_s:
-        if not times or min(abs(point - existing) for existing in times) >= max(8.0, interval / 2):
-            times.append(point)
-        point += max(5, interval)
+    if mode in {"hybrid", "interval"} or not times:
+        point = 0.0
+        while point <= duration_s:
+            if not times or min(abs(point - existing) for existing in times) >= max(8.0, interval / 2):
+                times.append(point)
+            point += max(5, interval)
 
     return sorted({round(min(duration_s, max(0.0, item)), 1) for item in times})
 
@@ -264,26 +417,17 @@ def candidate_ocr_times(chunks: List[TranscriptChunk], duration_s: float, interv
 def extract_ocr_timeline(path: Path, args: argparse.Namespace, chunks: List[TranscriptChunk]) -> List[OcrCheckpoint]:
     if args.ocr_backend == "none" or path.suffix.lower() not in VIDEO_EXTENSIONS:
         return []
-    if not has_command("tesseract"):
-        return []
 
     duration_s = media_duration_seconds(path, args.ffmpeg_bin)
     checkpoints: List[OcrCheckpoint] = []
     last_text = ""
     with tempfile.TemporaryDirectory(prefix="media_timeline_frames_") as tmp:
         temp_dir = Path(tmp)
-        for at_s in candidate_ocr_times(chunks, duration_s, args.ocr_interval):
+        for at_s in candidate_ocr_times(chunks, duration_s, args.ocr_mode, args.ocr_interval):
             frame = extract_frame(path, args.ffmpeg_bin, at_s, temp_dir)
             if frame is None:
                 continue
-            best_text = ""
-            best_method = ""
-            best_score = 0.0
-            for psm in (11, 6):
-                text, method = run_tesseract(frame, psm)
-                score = score_ocr_text(text)
-                if score > best_score:
-                    best_text, best_method, best_score = text, method, score
+            best_text, best_method, best_score = extract_image_text(frame, args.ocr_backend, args.hf_ocr_model)
             if best_score < args.min_ocr_score or len(normalize_text(best_text)) < 20:
                 continue
             if last_text and similarity(last_text, best_text) >= args.ocr_similarity_threshold:

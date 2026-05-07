@@ -1,6 +1,6 @@
 ---
 name: media-call-summary
-description: Summarize local call transcripts, recording timelines, or meeting media notes into reusable markdown summaries, decisions, action items, and follow-ups using Hugging Face summarization with heuristic fallback. #use/media-transcript #use/media-recording-timeline #use/skillbag-python-ensure
+description: Summarize local call transcripts, recording timelines, or meeting media notes into reusable markdown summaries, decisions, action items, and follow-ups grounded in transcript evidence. #use/media-transcript #use/media-recording-timeline #use/skillbag-python-ensure
 dependencies:
   - name: media-transcript
     required: false
@@ -45,13 +45,17 @@ optional:
   concise reusable call summary for later AI work.
 - If only a media file is available, use `media-transcript` or
   `media-recording-timeline` first.
-- Prefer the bundled helper, which follows the existing Halborn summary
-  pattern of Hugging Face summarization with heuristic fallback:
+- Read the transcript or timeline yourself before finalizing the summary. The
+  helper can produce a first-pass draft, but the final output should follow the
+  transcript evidence and should not rely blindly on model-ranked or
+  heuristic-ranked excerpts.
+- Optional helper:
   `python3 .skills/media-call-summary/scripts/media_call_summary.py --transcript-path <transcript-path> --output-markdown <output-markdown>`
 - Treat `transcript-path` as source evidence. Do not invent details not
   supported by the transcript.
 - `backend=auto` uses Hugging Face when available and falls back to heuristic
-  summarization. `backend=hf` requires the Hugging Face backend.
+  summarization. `backend=hf` requires the Hugging Face backend. These local
+  backends are draft aids, not replacements for evidence-grounded agent review.
 - Structure the summary for future retrieval:
   - short title
   - source path

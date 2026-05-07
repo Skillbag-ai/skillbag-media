@@ -49,8 +49,9 @@ def build_report(args: argparse.Namespace) -> Dict[str, Any]:
     if args.require_asr and not (whisper_cli or hf_asr):
         missing.append("whisper CLI or transformers+torch")
 
-    if args.require_ocr and not commands["tesseract"]["available"]:
-        missing.append("tesseract")
+    hf_ocr = modules["transformers"]["available"] and modules["torch"]["available"] and modules["PIL"]["available"]
+    if args.require_ocr and not (commands["tesseract"]["available"] or hf_ocr):
+        missing.append("tesseract or transformers+torch+Pillow")
 
     return {
         "commands": commands,
@@ -60,7 +61,9 @@ def build_report(args: argparse.Namespace) -> Dict[str, Any]:
             "whisper_cli_asr": whisper_cli,
             "huggingface_asr": hf_asr,
             "huggingface_summarization": hf_asr,
-            "screen_ocr": commands["tesseract"]["available"],
+            "screen_ocr": commands["tesseract"]["available"] or hf_ocr,
+            "tesseract_ocr": commands["tesseract"]["available"],
+            "huggingface_ocr": hf_ocr,
             "image_preprocessing": modules["PIL"]["available"],
         },
         "missing_required": missing,

@@ -92,31 +92,37 @@ Key parameters:
 - `input-path` and `output-markdown` are required
 - `title`, `summary`, and `tags` are optional
 - `hf-asr-model` defaults to `openai/whisper-large-v3-turbo`
+- `asr-device` defaults to `cpu`
 - `ocr-backend` defaults to `auto`
 
 Behavior:
 
 - creates timestamped transcript chunks
+- follows a transcript-first workflow for screen-share calls
 - extracts temporary video frames for screen OCR when useful
+- tries Tesseract with image preprocessing and can fall back to local Hugging
+  Face image-to-text OCR
 - keeps OCR checkpoints that add screen context
 - deletes temporary audio and frame files
 
 ### [media-call-summary](./.skills/media-call-summary/SKILL.md)
 
 Summarizes a local transcript or recording timeline into reusable meeting
-context using the existing Hugging Face-first summary pattern.
+context grounded in the transcript evidence.
 
 Key parameters:
 
 - `transcript-path` and `output-markdown` are required
 - `summary-purpose` defaults to `reusable-call-context`
 - decision, action item, and open question sections are enabled by default
-- `backend` defaults to `auto`, which uses Hugging Face when available and
-  falls back to a heuristic summary
+- `backend` defaults to `auto`, which can draft with Hugging Face when
+  available and falls back to a heuristic summary
 - `model-id` defaults to `t5-small`
 
 Use this after `media-transcript` or `media-recording-timeline` when the
 result should become easier to reuse in future AI work or resource indexes.
+The helper output is a draft aid; the agent should still inspect the source
+timeline and finalize an evidence-grounded summary.
 
 ## How To Use
 
